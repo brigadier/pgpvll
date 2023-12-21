@@ -1,0 +1,16 @@
+{application, pgpvll,
+ [{description, "pgpvll - Postgres connection pooling and monitorig"},
+  {vsn, "1.0.0"},
+  {registered, []},
+  {mod, {pgpvll_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    epgsql
+   ]},
+  {env,[]},
+  {modules, []},
+
+  {licenses, ["Apache-2.0"]},
+  {links, []}
+ ]}.
