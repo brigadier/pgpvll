@@ -52,7 +52,7 @@ example of configuration in config file, with two pools `foo` and `bar` and an o
 ```erlang
 pgpvll:connect(Opts) ->
     pgpvll:connect(default, Opts).
-connect(PoolName::any(), Opts::map()) - > {ok, [Conn::epgsql:connection(), {error, Reason :: epgsql:connect_error()]}|{error, message::any()}
+connect(PoolName::any(), Opts::map()) - > {ok, [Conn::epgsql:connection() | {error, Reason :: epgsql:connect_error()]}|{error, message::any()}
 ```
 
 This function would create a new pool. If the pool already exists it returns `{error, pool_alreeady_exists}`, otherwise an ok tuple with a list of connections and errors. Pay attention - even if it couldn't establish one or all connections the tuple will be still `{ok, ...}`. The connections in this list might be ignored, they are there for the case when you would want to check if everything is connected.
