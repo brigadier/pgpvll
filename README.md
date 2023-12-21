@@ -18,7 +18,7 @@ You should not store these connections, the normal way is to get a new connectio
 
 
 ## configuration
-Connection options are the same as in pgpool with additionap parameter `n` (the number of connections in the pool) which should be  a positive integer if specified. By default it equals to 10.
+Connection options are the same as in the epgsql with additionap parameter `n` (the number of connections in the pool) which should be  a positive integer if specified. By default it equals to 10.
 
 example of configuration in config file, with two pools `foo` and `bar` and an optional callback `test, fync` wihch would be called as `test:func()` and should return a tuple `{ok, ListOfPools}`
 
