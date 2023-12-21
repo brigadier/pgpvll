@@ -1,6 +1,6 @@
 {application, pgpvll,
  [{description, "pgpvll - Postgres connection pooling and monitorig"},
-  {vsn, "1.0.0"},
+  {vsn, "0.9.0"},
   {registered, []},
   {mod, {pgpvll_app, []}},
   {applications,

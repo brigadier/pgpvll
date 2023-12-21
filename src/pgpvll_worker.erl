@@ -22,15 +22,15 @@
 -define(PGTABLE, '_pgpwll_pgtable_').
 -define(NWORKERS, 10).
 
--record(pgpvll_worker_state, {}).
+-record(pgpvll_worker_state, {pools = #{}}).
 -record(pg_conn, {conn = undefined, ref = undefined, error = undefined}).
--record(poolrec, {poolname,  n, connections={}, params}).
+-record(poolrec, {poolname,  n, connections={}, opts}).
 %%====================================================================
 
 
 
-connect(PoolName, ConnParams) ->
-	gen_server:call(?SERVER, {connect, PoolName, ConnParams}).
+connect(PoolName, Opts) ->
+	gen_server:call(?SERVER, {connect, PoolName, Opts}).
 
 
 close(PoolName) ->
@@ -40,13 +40,11 @@ close(PoolName) ->
 conn(PoolName) ->
 	case ets:lookup(?PGTABLE, PoolName) of
 		[] -> {error, pool_not_found};
-		[#poolrec{n = N, connections = Connections}] ->
+		[{_, N, Connections}] ->
 			I = rand:uniform(N),
 			case element(I, Connections) of
-				#pg_conn{conn = undefined, error = Reason}  ->
-					{error, Reason};
-				#pg_conn{conn = Conn}  ->
-					{ok, Conn}
+				Conn when is_pid(Conn) -> {ok, Conn};
+				Else -> Else
 			end
 	end.
 
@@ -60,28 +58,54 @@ start_link() ->
 init([]) ->
 	process_flag(trap_exit, true),
 	_Table = ets:new(?PGTABLE, [set, named_table, protected,
-							   {keypos, 2}, {read_concurrency, true}]),
+								{keypos, 1}, {read_concurrency, true}]),
 
 	{ok, Pools} = read_env_pools(),
-	lists:foreach(
-		fun({PoolName, ConnParams}) ->
-			{ok, _PoolRec} = connect_pool(PoolName, ConnParams)
+	PoolsMap = lists:foldl(
+		fun({PoolName, Opts}, Acc) ->
+			case maps:is_key(PoolName, Acc) of
+				true ->
+					error({PoolName, exists});
+				_ ->
+					{ok, PoolRec} = connect_pool(PoolName, Opts),
+					Acc#{PoolName => PoolRec}
+			end
 		end,
+		#{},
 		Pools
 	),
 
-	{ok, #pgpvll_worker_state{}}.
+	{ok, #pgpvll_worker_state{pools = PoolsMap}}.
 
 
-handle_call({connect, PoolName, ConnParams}, _From, State = #pgpvll_worker_state{}) ->
-	Reply = connect_pool(PoolName, ConnParams),
+handle_call({connect, PoolName, Opts}, _From, State = #pgpvll_worker_state{pools = PoolsMap}) ->
 
-	{reply, Reply, State};
+	case maps:is_key(PoolName, PoolsMap) of
+		true ->
+			{reply, {error, pool_already_exists}, State};
+		false ->
+			{ok, #poolrec{connections = Connections} = PoolRec} = connect_pool(PoolName, Opts),
 
-handle_call({close, PoolName}, _From, State = #pgpvll_worker_state{}) ->
-	Reply = disconnect_pool(PoolName),
-	{reply, Reply, State}.
+			Reply = lists:map(
+				fun
+					(#pg_conn{conn = undefined, error = Error}) -> Error;
+					(#pg_conn{conn = Conn}) -> Conn
+				end,
+				Connections
+			),
+			{reply, {ok, Reply}, State#pgpvll_worker_state{pools = PoolsMap#{PoolName => PoolRec}}}
+	end;
 
+
+
+handle_call({close, PoolName}, _From, State = #pgpvll_worker_state{pools = PoolsMap}) ->
+	case PoolsMap of
+		#{PoolName := PoolRec} ->
+			ok = disconnect_pool(PoolRec),
+			{reply, ok, State#pgpvll_worker_state{pools = maps:remove(PoolName, PoolsMap)}};
+		_ ->
+			{reply, {error, pool_not_found}, State}
+	end.
 
 
 handle_cast(_Request, State = #pgpvll_worker_state{}) ->
@@ -89,10 +113,10 @@ handle_cast(_Request, State = #pgpvll_worker_state{}) ->
 
 
 
-handle_info({{'DOWN', PoolName}, _MonRef, process, Connection, ExitReason} , State = #pgpvll_worker_state{}) ->
-	?PRINT(down),
-	case ets:lookup(?PGTABLE, PoolName) of
-		[#poolrec{connections = ConnectionsTuple} = PoolRec] ->
+handle_info({{'DOWN', PoolName}, _MonRef, process, Connection, ExitReason} ,
+			State = #pgpvll_worker_state{pools = PoolsMap}) ->
+	case PoolsMap of
+		#{PoolName := #poolrec{connections = Connections} = PoolRec} ->
 			F = fun
 					(#pg_conn{conn = Conn} = PGConn) when Conn == Connection ->
 						TimerRef = initiate_reconnect(PoolName, ?MINDELAY),
@@ -100,44 +124,46 @@ handle_info({{'DOWN', PoolName}, _MonRef, process, Connection, ExitReason} , Sta
 					(PGConn) ->
 						PGConn
 				end,
-			Connections = list_to_tuple([F(C) || C <- tuple_to_list(ConnectionsTuple)]),
-			PoolRec2 = PoolRec#poolrec{connections = Connections},
-			true = ets:insert(?PGTABLE, PoolRec2);
-		_ ->
-			ok
-	end,
-	{noreply, State};
+			Connections2 = [F(C) || C <- Connections],
+			PoolRec2 = PoolRec#poolrec{connections = Connections2},
+			ok = ets_store(PoolRec2),
+			{noreply, State#pgpvll_worker_state{pools = PoolsMap#{PoolName => PoolRec2}}};
 
-handle_info({timeout, TimerRef, {reconnect, PoolName, OldDelay}}, State = #pgpvll_worker_state{}) ->
-	?PRINT(timeout),
-	NewDelay = min(?MAXDELAY, OldDelay*2),
-	case ets:lookup(?PGTABLE, PoolName) of
-		[#poolrec{connections = ConnectionsTuple, params = ConnParams} = PoolRec] ->
+		_ ->
+			{noreply, State}
+	end;
+
+
+handle_info({timeout, TimerRef, {reconnect, PoolName, OldDelay}},
+			State = #pgpvll_worker_state{pools = PoolsMap}) ->
+	NewDelay = min(?MAXDELAY, OldDelay * 2),
+	case PoolsMap of
+		#{PoolName := #poolrec{connections = Connections, opts = Opts} = PoolRec} ->
 			F = fun
 					(#pg_conn{ref = Ref} = _PGConn) when Ref == TimerRef ->
-						connect_one(PoolName, ConnParams, NewDelay);
+						connect_one(PoolName, Opts, NewDelay);
 					(PGConn) ->
 						PGConn
 				end,
-			Connections = list_to_tuple([F(C) || C <- tuple_to_list(ConnectionsTuple)]),
-			PoolRec2 = PoolRec#poolrec{connections = Connections},
-			true = ets:insert(?PGTABLE, PoolRec2);
+			Connections2 = [F(C) || C <- Connections],
+			PoolRec2 = PoolRec#poolrec{connections = Connections2},
+			ok = ets_store(PoolRec2),
+			{noreply, State#pgpvll_worker_state{pools = PoolsMap#{PoolName => PoolRec2}}};
 		_ ->
-			ok
-	end,
-	{noreply, State};
+			{noreply, State}
+	end;
+
 
 
 handle_info(_Info, State = #pgpvll_worker_state{}) ->
 	{noreply, State}.
 
-terminate(_Reason, _State = #pgpvll_worker_state{}) ->
-	L = ets:tab2list(?PGTABLE),
-	lists:foreach(
-		fun(#poolrec{poolname = PoolName, connections = ConTuple}) ->
-			disconnect_pool(PoolName, ConTuple)
+terminate(_Reason, _State = #pgpvll_worker_state{pools = PoolsMap}) ->
+	maps:foreach(
+		fun(_PoolName, PoolRec) ->
+			disconnect_pool(PoolRec)
 		end,
-		L
+		PoolsMap
 	),
 	ok.
 
@@ -148,21 +174,14 @@ code_change(_OldVsn, State = #pgpvll_worker_state{}, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-disconnect_pool(PoolName) ->
-	case ets:lookup(?PGTABLE, PoolName) of
-		[] -> {error, pool_not_found};
-		[#poolrec{connections = ConTuple}] -> disconnect_pool(PoolName, ConTuple)
-	end.
-
-disconnect_pool(PoolName, ConTuple) ->
-	Conns = tuple_to_list(ConTuple),
+disconnect_pool(#poolrec{connections = Connections, poolname = PoolName} = _PoolRec) ->
 	ets:delete(?PGTABLE, PoolName),
 	lists:foreach(
 		fun
 			(#pg_conn{conn = undefined}) -> ok;
 			(#pg_conn{conn = Conn}) -> catch epgsql:close(Conn)
 		end,
-		Conns
+		Connections
 	).
 
 read_env_pools() ->
@@ -182,50 +201,46 @@ read_env_pools() ->
 	end.
 
 
-connect_pool(PoolName, ConnParams) ->
-	case ets:lookup(?PGTABLE, PoolName) of
-		[] ->
-			NWorkers = maps:get(n, ConnParams, ?NWORKERS),
-			true = NWorkers > 0,
-			Result = connect_n(PoolName, ConnParams, NWorkers),
-			Return = lists:foldl(
-				fun
-					(#pg_conn{conn = undefined, error = Error}, {Good, Bad}) ->
-						{Good, [Error | Bad]};
-					(#pg_conn{conn = Conn}, {Good, Bad}) ->
-						{[Conn | Good], Bad}
-				end,
-				{[], []},
-				Result
-			),
-
-
-			PoolRec = #poolrec{
-				params = ConnParams,
-				poolname = PoolName,
-				n = NWorkers,
-				connections = erlang:list_to_tuple(Result)
-			},
-			true = ets:insert(?PGTABLE, PoolRec),
-			{ok, Return};
-		_ ->
-			{error, pool_exists}
-
-	end.
+connect_pool(PoolName, Opts) ->
+	NWorkers = maps:get(n, Opts, ?NWORKERS),
+	true = NWorkers > 0,
+	Result = connect_n(PoolName, Opts, NWorkers),
 
 
 
-connect_n(_PoolName, _ConnParams,  0) -> [];
+	PoolRec = #poolrec{
+		opts = Opts,
+		poolname = PoolName,
+		n = NWorkers,
+		connections = Result
+	},
+	ok = ets_store(PoolRec),
 
-connect_n(PoolName, ConnParams, NWorkers) ->
-	[connect_one(PoolName, ConnParams) |
-			  connect_n(PoolName, ConnParams, NWorkers-1)].
+	{ok, PoolRec}.
 
-connect_one(PoolName, ConnParams) ->
-	connect_one(PoolName, ConnParams, ?MINDELAY).
 
-connect_one(PoolName, ConnParams, Delay) ->
-	case catch epgsql:connect(ConnParams) of
+ets_store(#poolrec{poolname = PoolName, connections = Connections, n = N}) ->
+	T = list_to_tuple(lists:map(
+		fun
+			(#pg_conn{conn = undefined, error = Error}) -> Error;
+			(#pg_conn{conn = Conn}) -> Conn
+		end,
+		Connections
+	)),
+	true = ets:insert(?PGTABLE, {PoolName, N, T}),
+	ok.
+
+connect_n(_PoolName, _Opts, 0) -> [];
+
+connect_n(PoolName, Opts, NWorkers) ->
+	[connect_one(PoolName, Opts) |
+			  connect_n(PoolName, Opts, NWorkers-1)].
+
+connect_one(PoolName, Opts) ->
+	connect_one(PoolName, Opts, ?MINDELAY).
+
+connect_one(PoolName, Opts, Delay) ->
+	case catch epgsql:connect(Opts) of
 		{ok, Conn} ->
 			MonitorRef = erlang:monitor(process, Conn, [{tag, {'DOWN', PoolName}}]),
 			#pg_conn{conn = Conn, ref = MonitorRef};

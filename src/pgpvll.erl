@@ -11,11 +11,11 @@
 %% API
 -export([connect/1, connect/2, close/0, close/1, conn/0, conn/1]).
 
-connect(ConnParams) ->
-	connect(default, ConnParams).
+connect(Opts) ->
+	connect(default, Opts).
 
-connect(PoolName, ConnParams) ->
-	pgpvll_worker:connect(PoolName, ConnParams).
+connect(PoolName, Opts) ->
+	pgpvll_worker:connect(PoolName, Opts).
 
 
 close() ->
